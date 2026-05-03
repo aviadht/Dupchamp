@@ -8,6 +8,7 @@ import os
 import json
 import threading
 import subprocess
+import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -95,6 +96,13 @@ def parse_col_display(display_value):
     return display_value
 
 
+def sanitize_folder_name(name):
+    """Replace characters invalid in Windows folder/file names."""
+    for ch in r'\/:*?"<>|':
+        name = name.replace(ch, "_")
+    return name.strip(".").strip() or "_"
+
+
 def get_scan_columns(folder_path):
     """Read column names from all files in folder, return union of columns."""
     all_cols = []
@@ -116,8 +124,8 @@ class DupChampApp:
     def __init__(self, root):
         self.root = root
         self.root.title("DupChamp - Duplicate Row Finder")
-        self.root.geometry("1100x800")
-        self.root.minsize(900, 650)
+        self.root.geometry("1100x950")
+        self.root.minsize(900, 800)
 
         self.config = load_config()
         self.test_df = None
@@ -125,6 +133,7 @@ class DupChampApp:
         self.scan_columns = []
         self.mapping_rows = []  # list of (test_combo, scan_combo, row_frame)
         self.is_running = False
+        self.pdf_col_combo = None
 
         self._build_ui()
         self._restore_from_config()
@@ -155,6 +164,28 @@ class DupChampApp:
         ttk.Label(top_frame, text="(רלוונטי רק לקובץ Excel)", foreground="gray").grid(row=2, column=0, sticky=tk.W, padx=5, pady=(5, 0))
 
         top_frame.columnconfigure(1, weight=1)
+
+        # --- PDF Settings Frame ---
+        pdf_frame = ttk.LabelFrame(self.root, text="הגדרות PDF (אופציונלי)", padding=10)
+        pdf_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        ttk.Label(pdf_frame, text="תיקיית PDF מקור:").grid(row=0, column=2, sticky=tk.E, padx=(0, 5))
+        self.pdf_source_var = tk.StringVar()
+        ttk.Entry(pdf_frame, textvariable=self.pdf_source_var, width=70).grid(row=0, column=1, sticky=tk.EW, padx=5)
+        ttk.Button(pdf_frame, text="בחר תיקייה...", command=self._select_pdf_source).grid(row=0, column=0, padx=5)
+
+        ttk.Label(pdf_frame, text="תיקיית יעד לPDF:").grid(row=1, column=2, sticky=tk.E, padx=(0, 5), pady=(5, 0))
+        self.pdf_output_var = tk.StringVar()
+        ttk.Entry(pdf_frame, textvariable=self.pdf_output_var, width=70).grid(row=1, column=1, sticky=tk.EW, padx=5, pady=(5, 0))
+        ttk.Button(pdf_frame, text="בחר תיקייה...", command=self._select_pdf_output).grid(row=1, column=0, padx=5, pady=(5, 0))
+
+        ttk.Label(pdf_frame, text="עמודת שם קובץ PDF (בקבצים הנבדקים):").grid(row=2, column=2, sticky=tk.E, padx=(0, 5), pady=(5, 0))
+        self.pdf_col_var = tk.StringVar()
+        self.pdf_col_combo = ttk.Combobox(pdf_frame, textvariable=self.pdf_col_var, state="readonly", width=40)
+        self.pdf_col_combo.grid(row=2, column=1, sticky=tk.W, padx=5, pady=(5, 0))
+        self.pdf_col_combo.bind("<<ComboboxSelected>>", lambda e: self._save_pdf_config())
+
+        pdf_frame.columnconfigure(1, weight=1)
 
         # --- Column Mapping Frame ---
         map_frame = ttk.LabelFrame(self.root, text="מיפוי עמודות - הגדרת כפילויות", padding=10)
@@ -275,6 +306,21 @@ class DupChampApp:
         # Restore saved mappings
         self._try_restore_mappings()
 
+        # Restore PDF settings
+        if "pdf_source_folder" in self.config:
+            self.pdf_source_var.set(self.config["pdf_source_folder"])
+        if "pdf_output_folder" in self.config:
+            self.pdf_output_var.set(self.config["pdf_output_folder"])
+        if self.scan_columns and self.pdf_col_combo is not None:
+            scan_display = format_col_display(self.scan_columns)
+            self.pdf_col_combo["values"] = scan_display
+            saved_col = self.config.get("pdf_column", "")
+            if saved_col:
+                for dv in scan_display:
+                    if parse_col_display(dv) == saved_col:
+                        self.pdf_col_var.set(dv)
+                        break
+
     def _try_restore_mappings(self):
         saved_mappings = self.config.get("column_mappings", [])
         if self.test_columns and self.scan_columns:
@@ -378,6 +424,20 @@ class DupChampApp:
                     test_combo.set("")
                 if current_scan and parse_col_display(current_scan) not in self.scan_columns:
                     scan_combo.set("")
+            # Update PDF column combo (uses scan file columns)
+            if self.pdf_col_combo is not None:
+                self.pdf_col_combo["values"] = scan_display
+                current_pdf = self.pdf_col_var.get()
+                if current_pdf and parse_col_display(current_pdf) not in self.scan_columns:
+                    self.pdf_col_var.set("")
+                if not self.pdf_col_var.get():
+                    saved_col = self.config.get("pdf_column", "")
+                    if saved_col:
+                        for dv in scan_display:
+                            if parse_col_display(dv) == saved_col:
+                                self.pdf_col_var.set(dv)
+                                break
+
             # If no mapping rows exist, add one
             if not self.mapping_rows:
                 self._add_mapping_row()
@@ -452,6 +512,107 @@ class DupChampApp:
                 mappings.append((t, s))
         return mappings
 
+    # --- PDF Operations ---
+    def _select_pdf_source(self):
+        initial = self.pdf_source_var.get() or None
+        folder = filedialog.askdirectory(title="בחר תיקיית PDF מקור", initialdir=initial)
+        if folder:
+            self.pdf_source_var.set(folder)
+            self._save_pdf_config()
+
+    def _select_pdf_output(self):
+        initial = self.pdf_output_var.get() or None
+        folder = filedialog.askdirectory(title="בחר תיקיית יעד לPDF", initialdir=initial)
+        if folder:
+            self.pdf_output_var.set(folder)
+            self._save_pdf_config()
+
+    def _save_pdf_config(self):
+        self.config["pdf_source_folder"] = self.pdf_source_var.get()
+        self.config["pdf_output_folder"] = self.pdf_output_var.get()
+        pdf_col_display = self.pdf_col_var.get()
+        self.config["pdf_column"] = parse_col_display(pdf_col_display) if pdf_col_display else ""
+        save_config(self.config)
+
+    def _find_pdfs_by_number(self, pdf_folder, number_str):
+        """Find all PDF files recursively in pdf_folder whose name contains number_str."""
+        found = []
+        number_str = str(number_str).strip()
+        if not number_str:
+            return found
+        for root_dir, dirs, files in os.walk(pdf_folder):
+            for fname in files:
+                if fname.lower().endswith(".pdf") and number_str in fname:
+                    found.append(os.path.join(root_dir, fname))
+        return found
+
+    def _clear_folder(self, folder_path):
+        """Remove all contents of folder_path without deleting the folder itself."""
+        for item in os.listdir(folder_path):
+            item_path = os.path.join(folder_path, item)
+            try:
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.remove(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+            except Exception:
+                pass
+
+    def _copy_pdfs_for_duplicates(self, results):
+        """Find and copy PDFs matching duplicate rows to the output folder.
+        Returns a status message string, or None if PDF feature is not configured."""
+        pdf_source = self.pdf_source_var.get()
+        pdf_output = self.pdf_output_var.get()
+        pdf_col_display = self.pdf_col_var.get()
+
+        if not pdf_source or not pdf_output or not pdf_col_display:
+            return None
+
+        if not os.path.isdir(pdf_source):
+            return f"שגיאה: תיקיית PDF מקור לא נמצאה:\n{pdf_source}"
+
+        if os.path.exists(pdf_output):
+            import stat
+            def _on_rm_error(func, path, exc_info):
+                try:
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                except Exception:
+                    pass
+            shutil.rmtree(pdf_output, onerror=_on_rm_error)
+        os.makedirs(pdf_output)
+
+        # Group by test_row: {test_row -> set of pdf_numbers}
+        from collections import defaultdict
+        row_to_numbers = defaultdict(set)
+        for r in results:
+            number_val = r.get("pdf_number", "").strip()
+            if number_val:
+                row_to_numbers[r["test_row"]].add(number_val)
+
+        copied_count = 0
+        not_found = []
+
+        for test_row, pdf_numbers in sorted(row_to_numbers.items()):
+            subfolder = os.path.join(pdf_output, sanitize_folder_name(str(test_row)))
+            os.makedirs(subfolder, exist_ok=True)
+            for number_val in pdf_numbers:
+                pdfs = self._find_pdfs_by_number(pdf_source, number_val)
+                if not pdfs:
+                    not_found.append(f"שורה {test_row}: {number_val}")
+                    continue
+                for pdf_path in pdfs:
+                    dest = os.path.join(subfolder, os.path.basename(pdf_path))
+                    shutil.copy2(pdf_path, dest)
+                    copied_count += 1
+
+        msg = f"הועתקו {copied_count} קובצי PDF ל:\n{pdf_output}"
+        if not_found:
+            msg += f"\n\nלא נמצאו PDFים עבור {len(not_found)} ערכים:\n" + ", ".join(not_found[:10])
+            if len(not_found) > 10:
+                msg += f"\n... ועוד {len(not_found) - 10}"
+        return msg
+
     # --- Run ---
     def _run_check(self):
         folder = self.folder_var.get()
@@ -506,14 +667,17 @@ class DupChampApp:
         test_rows = len(self.test_df)
         self.stats_label.config(text=f"שורות בקובץ בדיקה: {test_rows} | קבצים לסריקה: {len(scan_files)}")
 
+        pdf_col_display = self.pdf_col_var.get()
+        pdf_col = parse_col_display(pdf_col_display) if pdf_col_display else ""
+
         thread = threading.Thread(
             target=self._do_scan,
-            args=(self.test_df, scan_files, test_cols, scan_cols, mappings),
+            args=(self.test_df, scan_files, test_cols, scan_cols, mappings, pdf_col),
             daemon=True,
         )
         thread.start()
 
-    def _do_scan(self, test_df, scan_files, test_cols, scan_cols, mappings):
+    def _do_scan(self, test_df, scan_files, test_cols, scan_cols, mappings, pdf_col=""):
         results = []
         test_keys = test_df[test_cols].astype(str)
 
@@ -564,12 +728,18 @@ class DupChampApp:
                             f"{tc}={v} → {sc}"
                             for (tc, sc), v in zip(mappings, test_key)
                         )
+                        # Read PDF number from the scan file's duplicate row
+                        scan_row_real_idx = scan_row_num - 2
+                        pdf_number = ""
+                        if pdf_col and pdf_col in scan_df.columns:
+                            pdf_number = str(scan_df.iloc[scan_row_real_idx][pdf_col]).strip()
                         results.append({
                             "test_row": test_row_idx + 2,
                             "dup_file": fpath,
                             "dup_file_name": os.path.basename(fpath),
                             "dup_row": scan_row_num,
                             "values": values_str,
+                            "pdf_number": pdf_number,
                         })
 
                 processed += 1
@@ -610,6 +780,24 @@ class DupChampApp:
 
         self.export_btn.config(state=tk.NORMAL)
         self._results_data = results
+
+        # Trigger PDF copy in background if configured
+        pdf_source = self.pdf_source_var.get()
+        pdf_output = self.pdf_output_var.get()
+        pdf_col_display = self.pdf_col_var.get()
+        if pdf_source and pdf_output and pdf_col_display:
+            self.progress_label.config(text="מעתיק PDF...")
+
+            def _pdf_done(msg):
+                self.progress_label.config(text="100%")
+                if msg:
+                    messagebox.showinfo("העתקת PDF", msg)
+
+            def _run_pdf_copy():
+                msg = self._copy_pdfs_for_duplicates(results)
+                self.root.after(0, _pdf_done, msg)
+
+            threading.Thread(target=_run_pdf_copy, daemon=True).start()
 
     def _on_tree_double_click(self, event):
         item = self.tree.selection()
